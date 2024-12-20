@@ -1,0 +1,162 @@
+#include "LoRaWan_APP.h"
+#include <ModbusMaster.h>
+
+// Modbus Pins
+#define MODBUS_RX GPIO3 // RX pin for Modbus (adjust as needed)
+#define MODBUS_TX GPIO1 // TX pin for Modbus (adjust as needed)
+
+// Modbus
+HardwareSerial modbusSerial(UART1); // Use HardwareSerial for Modbus
+ModbusMaster node;
+
+// LoRaWAN Settings
+uint8_t devEui[] = { 0x74, 0x3D, 0xCD, 0x67, 0xAA, 0x75, 0xBA, 0xE5 };
+uint8_t appEui[] = { 0x74, 0x3D, 0xCD, 0x67, 0xAA, 0x75, 0xBA, 0xE5 };
+uint8_t appKey[] = { 0x7A, 0x05, 0xA1, 0x66, 0xDC, 0x9D, 0xCE, 0x3C, 0xA3, 0xAC, 0x1B, 0xDE, 0x07, 0x77, 0xB6, 0x4E };
+
+DeviceClass_t loraWanClass = CLASS_A;                  // LoRaWAN Class
+LoRaMacRegion_t loraWanRegion = LORAMAC_REGION_US915; // LoRaWAN Region
+uint32_t appTxDutyCycle = 10000;                       // Transmission interval (ms)
+uint8_t appPort = 2;                                   // Application port
+bool isTxConfirmed = true;                             // Confirmed uplink
+uint8_t confirmedNbTrials = 4;                         // Retries for confirmed uplinks
+
+// Required global variables for CubeCell LoRaWAN library
+uint16_t userChannelsMask[6] = { 0xFF00, 0x0000, 0x0000, 0x0000, 0x0000, 0x8000 };
+bool loraWanAdr = true;
+bool overTheAirActivation = true;
+bool keepNet = false;
+uint8_t nwkSKey[16];
+uint8_t appSKey[16];
+uint32_t devAddr;
+
+// Renogy Controller Data
+const uint32_t num_data_registers = 35;
+
+struct Controller_data {
+    uint8_t battery_soc;
+    float battery_voltage;
+    float battery_charging_amps;
+    float load_voltage;
+    float load_amps;
+    uint8_t solar_panel_watts;
+    bool controller_connected;
+};
+Controller_data renogy_data;
+
+// Function Prototypes
+void prepareTxFrame(uint8_t port);
+void renogy_read_data_registers();
+
+void setup() {
+    Serial.begin(115200);
+    Serial.setDebugOutput(true); // Enable floating-point debugging
+    Serial.println("CubeCell LoRaWAN Node Initializing...");
+
+    // Initialize Modbus
+    modbusSerial.begin(9600);
+    node.begin(255, modbusSerial); // Address 255 for Renogy
+
+    // Initialize LoRaWAN
+    LoRaWAN.ifskipjoin();
+    deviceState = DEVICE_STATE_INIT; // Use the library's deviceState variable
+}
+
+void loop() {
+    switch (deviceState) {
+        case DEVICE_STATE_INIT:
+            Serial.println("Initializing LoRaWAN...");
+            LoRaWAN.init(loraWanClass, loraWanRegion);
+            deviceState = DEVICE_STATE_JOIN;
+            break;
+
+        case DEVICE_STATE_JOIN:
+            Serial.println("Joining LoRaWAN network...");
+            LoRaWAN.join();
+            break;
+
+        case DEVICE_STATE_SEND:
+            renogy_read_data_registers();
+            prepareTxFrame(appPort);
+            if (appDataSize > 0) {
+                LoRaWAN.send();
+                Serial.println("Confirmed uplink sending...");
+            } else {
+                Serial.println("No payload to send.");
+            }
+            deviceState = DEVICE_STATE_CYCLE;
+            break;
+
+        case DEVICE_STATE_CYCLE:
+            // Schedule next packet transmission
+            LoRaWAN.cycle(appTxDutyCycle + randr(0, 1000)); // Randomized offset
+            deviceState = DEVICE_STATE_SLEEP;
+            break;
+
+        case DEVICE_STATE_SLEEP:
+            LoRaWAN.sleep();
+            break;
+
+        default:
+            deviceState = DEVICE_STATE_INIT;
+            break;
+    }
+}
+
+// Prepare the payload of the frame
+void prepareTxFrame(uint8_t port) {
+    if (renogy_data.controller_connected) {
+        // Scale floating-point values to integers
+        int battery_voltage_scaled = renogy_data.battery_voltage * 100;
+        int battery_charging_amps_scaled = renogy_data.battery_charging_amps * 100;
+        int load_voltage_scaled = renogy_data.load_voltage * 100;
+        int load_amps_scaled = renogy_data.load_amps * 100;
+
+        // Prepare the payload string
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "batt_soc:%d,batt_volt:%d.%02d,chrg_amps:%d.%02d,load_volt:%d.%02d,load_amps:%d.%02d,solar_watts:%d",
+                 renogy_data.battery_soc,
+                 battery_voltage_scaled / 100, battery_voltage_scaled % 100,
+                 battery_charging_amps_scaled / 100, battery_charging_amps_scaled % 100,
+                 load_voltage_scaled / 100, load_voltage_scaled % 100,
+                 load_amps_scaled / 100, load_amps_scaled % 100,
+                 renogy_data.solar_panel_watts);
+
+        appDataSize = strlen(message); // Length of the message
+        memcpy(appData, message, appDataSize);
+
+        Serial.print("Prepared Payload: ");
+        Serial.println(message); // Debug output
+    } else {
+        Serial.println("No data to send: Controller not connected.");
+        appDataSize = 0; // No data to send
+    }
+}
+
+// Read data from the Renogy controller, or simulate if unavailable
+void renogy_read_data_registers() {
+    uint8_t result = node.readHoldingRegisters(0x100, num_data_registers);
+    if (result == node.ku8MBSuccess) {
+        renogy_data.controller_connected = true;
+        renogy_data.battery_soc = node.getResponseBuffer(0);
+        renogy_data.battery_voltage = node.getResponseBuffer(1) * 0.1;
+        renogy_data.battery_charging_amps = node.getResponseBuffer(2) * 0.1;
+        renogy_data.load_voltage = node.getResponseBuffer(4) * 0.1;
+        renogy_data.load_amps = node.getResponseBuffer(5) * 0.01;
+        renogy_data.solar_panel_watts = node.getResponseBuffer(9);
+        Serial.println("Modbus data read successfully.");
+    } else {
+        renogy_data.controller_connected = false;
+        Serial.println("Failed to read Modbus data. Simulating...");
+
+        // Simulated data
+        renogy_data.controller_connected = true;
+        renogy_data.battery_soc = 75;
+        renogy_data.battery_voltage = 12.5;
+        renogy_data.battery_charging_amps = 5.0;
+        renogy_data.load_voltage = 12.3;
+        renogy_data.load_amps = 1.2;
+        renogy_data.solar_panel_watts = 100;
+    }
+}
